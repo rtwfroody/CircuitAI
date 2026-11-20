@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <list>
+#include <deque>
 
 namespace circuit {
 
@@ -115,6 +116,12 @@ public:
 
 	int GetMaxPathThreads() const { return maxPathThreads; }
 
+	/*
+	 * circuitsync: the engine frame now being played, set at the start of every
+	 * CCircuitAI::Update. A job submitted in frame F is due in frame F + JOB_DUE_FRAMES.
+	 */
+	static void SetEngineFrame(int frame) { engineFrame = frame; }
+
 private:
 	std::weak_ptr<CScheduler> self;
 	int lastFrame;
@@ -149,43 +156,55 @@ private:
 
 	std::vector<std::shared_ptr<CGameTask>> removeTasks;
 
-	struct WorkTask: public BaseContainer {
-		WorkTask(const std::weak_ptr<CScheduler>& scheduler, const std::shared_ptr<CGameTask>& task,
-				 const std::shared_ptr<CGameTask>& onComplete)
-			: BaseContainer(task), onComplete(onComplete), scheduler(scheduler) {}
+	/*
+	 * circuitsync: one parallel or path job. The main thread keeps every job of
+	 * this scheduler in `jobs`, in submission order, and applies a job's result
+	 * only in its due frame, after it and every job due with it is done. So
+	 * what Circuit does depends on sim frames alone, never on how fast the
+	 * threads ran or which pather finished first.
+	 *
+	 * The job owns everything the main thread made for it (tasks, callbacks,
+	 * the path query), so all of it is destroyed on the main thread at apply;
+	 * the threads drop their reference before marking the job done.
+	 */
+	struct SJob {
+		int dueFrame;
+		bool isDone = false;  // guarded by jobMutex
+		// parallel job
+		std::shared_ptr<CGameTask> task;
 		std::shared_ptr<CGameTask> onComplete;
+		// path job: query is held here so that the main thread destroys it;
+		// "anyone else still holds it" (use_count() > 1) is what the stock
+		// weak_ptr test meant
+		std::shared_ptr<IPathQuery> query;
+		PathFunc pathTask;
+		PathedFunc onPathed;
+	};
+	std::deque<std::shared_ptr<SJob>> jobs;  // main thread only
+
+	std::shared_ptr<SJob> NewJob();
+	void ApplyDueJobs(int frame);
+	static void FinishJob(std::shared_ptr<SJob>&& job);
+
+	struct WorkTask {
+		WorkTask(const std::weak_ptr<CScheduler>& scheduler, const std::shared_ptr<SJob>& job)
+			: scheduler(scheduler), job(job) {}
 		std::weak_ptr<CScheduler> scheduler;
+		std::shared_ptr<SJob> job;  // nullptr: wake-up at shutdown
 	};
 	static CMultiQueue<WorkTask> workTasks;
 
-	struct FinishTask: public BaseContainer {
-		FinishTask(const std::shared_ptr<CGameTask>& task)
-			: BaseContainer(task) {}
-		FinishTask(const WorkTask& workTask)
-			: BaseContainer(workTask.onComplete) {}
-	};
-	CMultiQueue<FinishTask> finishTasks;  // onComplete
-
 	struct PathTask {
-		PathTask(const std::weak_ptr<CScheduler>& scheduler, const std::shared_ptr<IPathQuery>& query,
-				PathFunc&& task, PathedFunc&& onComplete)
-			: scheduler(scheduler), query(query), task(std::move(task)), onComplete(std::move(onComplete)) {}
+		PathTask(const std::weak_ptr<CScheduler>& scheduler, const std::shared_ptr<SJob>& job)
+			: scheduler(scheduler), job(job) {}
 		std::weak_ptr<CScheduler> scheduler;
-		std::weak_ptr<IPathQuery> query;
-		PathFunc task;
-		PathedFunc onComplete;
+		std::shared_ptr<SJob> job;  // nullptr: wake-up at shutdown
 	};
 	static CMultiQueue<PathTask> pathTasks;
 
-	struct PathedTask {
-		PathedTask(PathedFunc&& func)
-			: onComplete(std::move(func)) {}
-		PathedTask(const PathTask& pathTask)
-			: query(pathTask.query), onComplete(std::move(pathTask.onComplete)) {}
-		std::weak_ptr<IPathQuery> query;
-		PathedFunc onComplete;
-	};
-	CMultiQueue<PathedTask> pathedTasks;  // onComplete
+	static spring::mutex jobMutex;
+	static spring::condition_variable_any jobCond;
+	static int engineFrame;
 
 	std::vector<std::shared_ptr<CGameTask>> initTasks;
 	std::vector<std::shared_ptr<CGameTask>> releaseTasks;

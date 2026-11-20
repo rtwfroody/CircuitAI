@@ -11,9 +11,17 @@
 namespace circuit {
 
 #define MAX_JOB_THREADS		4
+// circuitsync: a parallel or path job submitted in engine frame F is applied
+// in frame F + JOB_DUE_FRAMES, never earlier or later (see NewJob).
+#define JOB_DUE_FRAMES		1
 
 CMultiQueue<CScheduler::WorkTask> CScheduler::workTasks;
 CMultiQueue<CScheduler::PathTask> CScheduler::pathTasks;
+// One lock for every instance's jobs: the worker and pathers are shared by all
+// CircuitAI instances in the process, and a done job is waited on by its own.
+spring::mutex CScheduler::jobMutex;
+spring::condition_variable_any CScheduler::jobCond;
+int CScheduler::engineFrame = -1;
 spring::thread CScheduler::workerThread;
 std::vector<spring::thread> CScheduler::patherThreads;
 int CScheduler::maxPathThreads = 1;
@@ -75,14 +83,14 @@ void CScheduler::Release()
 	if (counterInstance == 0 && workerRunning.load()) {
 		workerRunning = false;
 		// At this point workTasks is empty. Push empty task in case worker stuck at Pop().
-		workTasks.Push({self, nullptr, nullptr});
+		workTasks.Push({self, nullptr});
 		if (workerThread.joinable()) {
 			workerThread.join();
 		}
 		workTasks.Clear();
 
 		for (unsigned int i = 0; i < patherThreads.size(); ++i) {
-			pathTasks.Push({self, nullptr, nullptr, nullptr});
+			pathTasks.Push({self, nullptr});
 		}
 		for (std::thread& t : patherThreads) {
 			if (t.joinable()) {
@@ -95,8 +103,7 @@ void CScheduler::Release()
 
 	barrier.Wait([this]() { return !isWorkProcess && (numPathProcess == 0); });
 
-	finishTasks.Clear();
-	pathedTasks.Clear();
+	jobs.clear();  // circuitsync: released, never applied
 }
 
 void CScheduler::StartThreads()
@@ -150,18 +157,11 @@ void CScheduler::ProcessTasks(int frame)
 		}
 	}
 
-	// Process onComplete from parallel tasks
-	CMultiQueue<FinishTask>::ProcessFunction process = [](FinishTask& item) {
-		item.task->Run();
-	};
-	if (!finishTasks.PopAndProcess(process)) {  // one heavy
-		pathedTasks.PopAndProcessAll([](PathedTask& item) {  // many lite
-			std::shared_ptr<IPathQuery> query = item.query.lock();
-			if (query != nullptr) {
-				item.onComplete(query);
-			}
-		});
-	}
+	// circuitsync: apply every parallel and path job due by this frame, in
+	// submission order, waiting for any not done yet. Stock applied at most one
+	// parallel result per frame, path results only on frames without one, and
+	// each whenever its thread happened to finish.
+	ApplyDueJobs(frame);
 
 	// Update task queues
 	if (!removeTasks.empty()) {
@@ -175,16 +175,89 @@ void CScheduler::ProcessTasks(int frame)
 	isProcessing = false;
 }
 
+std::shared_ptr<CScheduler::SJob> CScheduler::NewJob()
+{
+	std::shared_ptr<SJob> job = std::make_shared<SJob>();
+	// One frame: the job overlaps the rest of this frame (other AIs, our brain,
+	// the sim of the next frame) and the main thread blocks only if it is
+	// still running when this AI's next Update comes. A job submitted before
+	// ProcessTasks in an Update (AllyTeam's threat/influence/enemy refresh) is
+	// tagged by the engine frame, not by lastFrame, so it too gets a frame.
+	job->dueFrame = engineFrame + JOB_DUE_FRAMES;
+	jobs.push_back(job);
+	return job;
+}
+
+void CScheduler::ApplyDueJobs(int frame)
+{
+	// Due frames never decrease in submission order, so the due jobs are a prefix.
+	size_t numDue = 0;
+	while ((numDue < jobs.size()) && (jobs[numDue]->dueFrame <= frame)) {
+		++numDue;
+	}
+	if (numDue == 0) {
+		return;
+	}
+
+	// Every due job is done before any is applied: an apply may change what a
+	// job still running reads (a buffer swap, say).
+	{
+		std::unique_lock<spring::mutex> lock(jobMutex);
+		size_t i = 0;
+		jobCond.wait(lock, [this, numDue, &i]() {
+			while ((i < numDue) && jobs[i]->isDone) {
+				++i;
+			}
+			return i == numDue;
+		});
+	}
+
+	// Off the queue before applying: an apply may submit jobs (due next frame).
+	std::vector<std::shared_ptr<SJob>> due(jobs.begin(), jobs.begin() + numDue);
+	jobs.erase(jobs.begin(), jobs.begin() + numDue);
+	for (std::shared_ptr<SJob>& job : due) {
+		if (job->query != nullptr) {
+			// Stock skipped a query nobody holds any more; ours is the job's reference.
+			if ((job->onPathed != nullptr) && (job->query.use_count() > 1)) {
+				job->onPathed(job->query);
+			}
+		} else if (job->onComplete != nullptr) {
+			job->onComplete->Run();
+		}
+		job = nullptr;  // destroyed here, on the main thread
+	}
+}
+
+void CScheduler::FinishJob(std::shared_ptr<SJob>&& job)
+{
+	{
+		// The thread's reference goes under the lock, before isDone: the main
+		// thread sees isDone only after it, so the main thread's reference is
+		// the last and the job (closures, query) is destroyed there.
+		std::lock_guard<spring::mutex> lock(jobMutex);
+		job->isDone = true;
+		job = nullptr;
+	}
+	jobCond.notify_all();
+}
+
 void CScheduler::RunParallelTask(const std::shared_ptr<CGameTask>& task, const std::shared_ptr<CGameTask>& onComplete)
 {
 	StartThreads();
-	workTasks.Push({self, task, onComplete});
+	std::shared_ptr<SJob> job = NewJob();
+	job->task = task;
+	job->onComplete = onComplete;
+	workTasks.Push({self, job});
 }
 
 void CScheduler::RunPathTask(const std::shared_ptr<IPathQuery>& query, PathFunc&& task, PathedFunc&& onComplete)
 {
 	StartThreads();
-	pathTasks.Push({self, query, std::move(task), std::move(onComplete)});
+	std::shared_ptr<SJob> job = NewJob();
+	job->query = query;
+	job->pathTask = std::move(task);
+	job->onPathed = std::move(onComplete);
+	pathTasks.Push({self, job});
 }
 
 void CScheduler::RemoveTask(const std::shared_ptr<CGameTask>& task)
@@ -201,19 +274,22 @@ void CScheduler::WorkerThread()
 {
 	while (workerRunning.load()) {
 		WorkTask container = workTasks.Pop();
+		if (container.job == nullptr) {
+			continue;  // shutdown wake-up
+		}
 
 		std::shared_ptr<CScheduler> scheduler = container.scheduler.lock();
 		if (scheduler != nullptr) {
 			scheduler->barrier.NotifyOne([scheduler]() { scheduler->isWorkProcess = true; });
 			if (scheduler->isRunning) {
 
-				container.task->Run();
-				if (container.onComplete != nullptr) {
-					scheduler->finishTasks.Push(container);
-				}
+				container.job->task->Run();
 
 			}
+			FinishJob(std::move(container.job));
 			scheduler->barrier.NotifyOne([scheduler]() { scheduler->isWorkProcess = false; });
+		} else {
+			FinishJob(std::move(container.job));
 		}
 	}
 }
@@ -222,25 +298,25 @@ void CScheduler::PatherThread(int num)
 {
 	while (workerRunning.load()) {
 		PathTask container = pathTasks.Pop();
-
-		std::shared_ptr<IPathQuery> query = container.query.lock();
-		if (query == nullptr) {
-			continue;
+		if (container.job == nullptr) {
+			continue;  // shutdown wake-up
 		}
+
 		std::shared_ptr<CScheduler> scheduler = container.scheduler.lock();
 		if (scheduler == nullptr) {
+			FinishJob(std::move(container.job));
 			continue;
 		}
 
 		scheduler->barrier.NotifyOne([scheduler]() { scheduler->numPathProcess++; });
-		if (scheduler->isRunning) {
+		// A query only the job holds is dropped at apply anyway (ApplyDueJobs);
+		// skipping it here saves the work and changes nothing.
+		if (scheduler->isRunning && (container.job->query.use_count() > 1)) {
 
-			container.task(query, num);
-			if (container.onComplete != nullptr) {
-				scheduler->pathedTasks.Push(container);
-			}
+			container.job->pathTask(container.job->query, num);
 
 		}
+		FinishJob(std::move(container.job));
 		scheduler->barrier.NotifyOne([scheduler]() { scheduler->numPathProcess--; });
 	}
 }
