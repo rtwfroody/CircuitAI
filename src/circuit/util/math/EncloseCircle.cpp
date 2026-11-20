@@ -10,6 +10,7 @@
 
 #include <random>
 #include <algorithm>
+#include <cstdlib>
 #include <assert.h>
 
 namespace circuit {
@@ -48,8 +49,9 @@ void CEncloseCircle::MakeCircle(const std::vector<AIFloat3>& points)
 		}
 		// Randomize order
 		// TODO: Read why shuffle??
-		std::random_device rd;
-		std::mt19937 g(rd());
+		// circuitsync: seeded from the game's srand(random_seed) stream, not
+		// std::random_device, so the shuffle is the same in every run of a seed
+		std::mt19937 g(rand());
 		std::shuffle(shuffled.begin(), shuffled.end(), g);
 
 		// Progressively add points to circle or recompute circle
