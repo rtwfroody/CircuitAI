@@ -719,6 +719,7 @@ int CCircuitAI::Release(int reason)
 int CCircuitAI::Update(int frame)
 {
 	lastFrame = frame;
+	CScheduler::SetEngineFrame(frame);  // circuitsync: due frames of parallel/path jobs
 	if (isResigned) {
 		Release(RELEASE_RESIGN);
 		NotifyResign();
